@@ -79,9 +79,11 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 {
 	u32 val = 0;
 
+	// fast path
 	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
 		return;
 
+	// 只有一个cpu会走fast path，其他竞争者都会进入slow path
 	queued_spin_lock_slowpath(lock, val);
 }
 #endif

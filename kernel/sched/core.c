@@ -4392,7 +4392,7 @@ static void __sched notrace __schedule(bool preempt)
 	rq = cpu_rq(cpu);
 	prev = rq->curr;
 
-	schedule_debug(prev, preempt);
+	schedule_debug(prev, preempt); // 需要打开特定的debug conf之后才会用到
 
 	if (sched_feat(HRTICK))
 		hrtick_clear(rq);

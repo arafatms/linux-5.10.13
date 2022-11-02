@@ -323,6 +323,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (pv_enabled())
 		goto pv_queue;
 
+	// ??
 	if (virt_spin_lock(lock))
 		return;
 
@@ -332,6 +333,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 *
 	 * 0,1,0 -> 0,0,1
 	 */
+	/* 情况4: CPU0 首先加锁，CPU1设置pending，CPU0解锁，CPU0还没来得及加锁，这里属于一个临界值，所以CPU2需要自旋_Q_PENDING_LOOPS次 */
 	if (val == _Q_PENDING_VAL) {
 		int cnt = _Q_PENDING_LOOPS;
 		val = atomic_cond_read_relaxed(&lock->val,
@@ -342,6 +344,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * If we observe any contention; queue.
 	 * 检查锁 (`val`) 的状态是上锁还是待定的(pending)
 	 */
+	/* （x, y, 0*) 说明已经有竞争者进行了排队，需要当前CPU也在mcs_spinlock队列上进行排队 */
 	if (val & ~_Q_LOCKED_MASK)
 		goto queue;
 
@@ -349,6 +352,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * trylock || pending
 	 *
 	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
+	 * 进入slow path的第一个CPU
 	 */
 	val = queued_fetch_set_pending_acquire(lock);
 
@@ -358,6 +362,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * Undo and queue; our setting of PENDING might have made the
 	 * n,0,0 -> 0,0,0 transition fail and it will now be waiting
 	 * on @next to become !NULL.
+	 * 同时有两个CPU设置pending位的情况，pending设置失败的到msc队列排队
 	 */
 	if (unlikely(val & ~_Q_LOCKED_MASK)) {
 
@@ -378,6 +383,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * sequentiality; this is because not all
 	 * clear_pending_set_locked() implementations imply full
 	 * barriers.
+	 * 设置pending位成功，需要再lock->val上自旋
 	 */
 	if (val & _Q_LOCKED_MASK)
 		atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_MASK));
@@ -386,6 +392,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * take ownership and clear the pending bit.
 	 *
 	 * 0,1,0 -> 0,0,1
+	 * 该我了，取消pending位并加锁退出
 	 */
 	clear_pending_set_locked(lock);
 	lockevent_inc(lock_pending);
@@ -455,7 +462,7 @@ pv_queue:
 	 * Publish the updated tail.
 	 * We have already touched the queueing cacheline; don't bother with
 	 * pending stuff.
-	 *
+	 * 设置mcs_pinlock的队尾为本CPU的per-cpu msc_spinlock
 	 * p,*,* -> n,*,*
 	 */
 	old = xchg_tail(lock, tail);
@@ -468,10 +475,12 @@ pv_queue:
 	if (old & _Q_TAIL_MASK) {
 		prev = decode_tail(old);
 
+		/* 将本CPU放到队列尾部 */
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
 
 		pv_wait_node(node, prev);
+		/* 在本地per cpu mcs_spinlock上自旋 */
 		arch_mcs_spin_lock_contended(&node->locked);
 
 		/*
@@ -509,6 +518,7 @@ pv_queue:
 	if ((val = pv_wait_head_or_lock(lock, node)))
 		goto locked;
 
+	// 自旋，待pending和locked均为0
 	val = atomic_cond_read_acquire(&lock->val, !(VAL & _Q_LOCKED_PENDING_MASK));
 
 locked:
@@ -532,12 +542,14 @@ locked:
 	 * Note: at this point: (val & _Q_PENDING_MASK) == 0, because of the
 	 *       above wait condition, therefore any concurrent setting of
 	 *       PENDING will make the uncontended transition fail.
+	 * 没有其他竞争者清空tail
 	 */
 	if ((val & _Q_TAIL_MASK) == tail) {
 		if (atomic_try_cmpxchg_relaxed(&lock->val, &val, _Q_LOCKED_VAL))
 			goto release; /* No contention */
 	}
 
+	/* 有其他竞争者的情况，先加锁让mcs队列中的下一个CPU成为队列头 */
 	/*
 	 * Either somebody is queued behind us or _Q_PENDING_VAL got set
 	 * which will then detect the remaining tail and queue behind us
