@@ -297,8 +297,11 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 	int loop;
 	bool wait_early;
 
+	// 自旋至到达队列头（其实很多时候是在hlt, vCPU被kick之后再进入循环去hlt
 	for (;;) {
+		// 自旋
 		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
+			// 队列头的CPU通知该CPU该你出马了
 			if (READ_ONCE(node->locked))
 				return;
 			if (pv_wait_early(pp, loop)) {
@@ -316,12 +319,15 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		 * [L] pn->locked		[RmW] pn->state = vcpu_hashed
 		 *
 		 * Matches the cmpxchg() from pv_kick_node().
+		 * 设置hlt状态
 		 */
 		smp_store_mb(pn->state, vcpu_halted);
 
+		// 不信邪，要再查看一次lock位
 		if (!READ_ONCE(node->locked)) {
 			lockevent_inc(pv_wait_node);
 			lockevent_cond_inc(pv_wait_early, wait_early);
+			// hlt vCPU
 			pv_wait(&pn->state, vcpu_halted);
 		}
 
@@ -410,6 +416,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 	/*
 	 * If pv_kick_node() already advanced our state, we don't need to
 	 * insert ourselves into the hash table anymore.
+	 * pv_kick_none 可能已经将下一个节点（也就是当前的node）放入PV Hash里了,要避免重复放到哈希中
 	 */
 	if (READ_ONCE(pn->state) == vcpu_hashed)
 		lp = (struct qspinlock **)1;
@@ -429,17 +436,18 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 		/*
 		 * Set the pending bit in the active lock spinning loop to
 		 * disable lock stealing before attempting to acquire the lock.
+		 * 在这里自旋一定时间
 		 */
 		set_pending(lock);
 		for (loop = SPIN_THRESHOLD; loop; loop--) {
 			if (trylock_clear_pending(lock))
-				goto gotlock;
+				goto gotlock;	// 获取到锁了
 			cpu_relax();
 		}
 		clear_pending(lock);
 
 
-		if (!lp) { /* ONCE */
+		if (!lp) { /* ONCE  放入哈希中 */
 			lp = pv_hash(lock, pn);
 
 			/*
@@ -464,9 +472,11 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
 				goto gotlock;
 			}
 		}
+		/* 改变pv node的状态指hashed */
 		WRITE_ONCE(pn->state, vcpu_hashed);
 		lockevent_inc(pv_wait_head);
 		lockevent_cond_inc(pv_wait_again, waitcnt);
+		/* halt vCPU */
 		pv_wait(&lock->locked, _Q_SLOW_VAL);
 
 		/*
@@ -488,6 +498,7 @@ gotlock:
 /*
  * PV versions of the unlock fastpath and slowpath functions to be used
  * instead of queued_spin_unlock().
+ * 唤醒下一个node
  */
 __visible void
 __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
@@ -552,11 +563,13 @@ __visible void __pv_queued_spin_unlock(struct qspinlock *lock)
 	 * We must not unlock if SLOW, because in that case we must first
 	 * unhash. Otherwise it would be possible to have multiple @lock
 	 * entries, which would be BAD.
+	 * fast path
 	 */
 	locked = cmpxchg_release(&lock->locked, _Q_LOCKED_VAL, 0);
 	if (likely(locked == _Q_LOCKED_VAL))
 		return;
 
+	/* slow path里唤醒下一个node,unhash */
 	__pv_queued_spin_unlock_slowpath(lock, locked);
 }
 #endif /* __pv_queued_spin_unlock */

@@ -479,6 +479,7 @@ pv_queue:
 		/* Link @node into the waitqueue. */
 		WRITE_ONCE(prev->next, node);
 
+		// PV spinlock 场景下，先跟native spinlock一样自旋一定时间，然后halt vCPU
 		pv_wait_node(node, prev);
 		/* 在本地per cpu mcs_spinlock上自旋 */
 		arch_mcs_spin_lock_contended(&node->locked);
@@ -513,7 +514,7 @@ pv_queue:
 	 * atomic_cmpxchg_relaxed() calls will be safe.
 	 *
 	 * If PV isn't active, 0 will be returned instead.
-	 *
+	 * pv spinlock已经到达队列头部，自旋一定时间如果获取不到锁就hlt
 	 */
 	if ((val = pv_wait_head_or_lock(lock, node)))
 		goto locked;
@@ -563,7 +564,9 @@ locked:
 	if (!next)
 		next = smp_cond_load_relaxed(&node->next, (VAL));
 
+	/* 设置下一个node的locked位 */
 	arch_mcs_spin_unlock_contended(&next->locked);
+	/* 唤醒处理下一个node，将本node的flag设为slow，slow unlock path里会用pv_kick唤醒下一个node */
 	pv_kick_node(lock, next);
 
 release:
